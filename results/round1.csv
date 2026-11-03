@@ -1,0 +1,11 @@
+round,task,model,condition,run,passed,wall_s,turns,mcp_calls,shell_calls,other_calls,cost_usd
+1,timing_triage,claude-opus-5-5,shell,1,True,29,6,0,5,0,0.27399640000000003
+1,timing_triage,claude-opus-5-5,mcp,1,True,22,5,0,4,0,0.2152982
+1,csr_address,claude-opus-5-5,shell,1,True,76,10,0,9,0,0.2633778
+1,fsm_stuck,claude-opus-5-5,shell,1,True,115,13,0,12,0,0.36059280000000005
+1,csr_address,claude-opus-5-5,mcp,1,True,67,12,0,11,0,0.3241734
+1,fsm_stuck,claude-opus-5-5,mcp,1,True,59,8,0,7,0,0.30791140000000006
+1,ticker_reset,claude-opus-5-5,shell,1,True,390,13,0,12,0,0.30557639999999997
+1,ticker_reset,claude-opus-5-5,mcp,1,True,76,11,0,10,0,0.3036266
+1,bios_memtest,claude-opus-5-5,shell,1,True,582,13,0,12,0,0.2590844
+1,bios_memtest,claude-opus-5-5,mcp,1,True,144,14,2,10,1,0.23825500000000005
