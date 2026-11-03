@@ -83,16 +83,62 @@ def selftest_task(task):
 # - shell:   shell and file tools, no MCP server.
 # - mcp:     shell, file tools and litex_mcp (the agent chooses).
 # - mcponly: litex_mcp and file tools, no shell.
-CONDITIONS = ["shell", "mcp", "mcponly"]
+# - delegate: a planner (file tools, no shell, no direct bench access) that delegates the bench work
+#             to a "bench-operator" subagent (another, usually cheaper, model) that only has
+#             litex_mcp. A PreToolUse hook denies litex_mcp calls that do not come from the operator.
+CONDITIONS = ["shell", "mcp", "mcponly", "delegate"]
+
+OPERATOR = "bench-operator"
+OPERATOR_DESCRIPTION = ("Bench operator: runs measurements and actions on the running LiteX SoC "
+    "(registers, memory, console, LiteScope, simulation/server jobs) with the LiteX MCP tools, and "
+    "reports the results. Give it precise requests (what to configure, what to measure, which values) "
+    "and it answers with tables and short conclusions.")
+OPERATOR_PROMPT = ("You are a bench operator for a LiteX SoC. You only have the LiteX MCP tools. Do "
+    "exactly what is asked: check the link (litex_check) when you start, run the requested "
+    "configurations and measurements (litex_register_sequence runs several register steps and "
+    "sweeps in one call), and report the raw results as a compact table, then a short factual "
+    "summary of what you observed. Do not speculate about the cause unless asked. If something "
+    "fails (link, timeout, unexpected value), report it as is.")
+
+def _agent_pythonpath():
+    """PYTHONPATH for the agent and its tools: the caller's, without this repository (the
+    checkers and solutions must stay out of the agent's reach)."""
+    root  = os.path.realpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+    paths = [p for p in os.environ.get("PYTHONPATH", "").split(os.pathsep) if p]
+    return os.pathsep.join(p for p in paths if os.path.realpath(p) != root)
+
+def _agent_env():
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _agent_pythonpath()
+    return env
+
+def operator_hook():
+    """PreToolUse hook command: deny litex_mcp calls that do not come from the bench operator."""
+    code = ("import json,sys; d=json.load(sys.stdin); "
+        f"sys.exit(0) if d.get('agent_type') == '{OPERATOR}' else "
+        "print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', "
+        "'permissionDecision': 'deny', 'permissionDecisionReason': "
+        f"'The bench is only reachable through the {OPERATOR} agent.'}}}}))")
+    return f"{sys.executable} -c \"{code}\""
 
 FILE_TOOLS_ALLOWED = ["Read", "Edit", "Write", "Grep", "Glob"]
+
+# litex_mcp tools (with --allow-write), given to the bench operator of the delegate condition.
+LITEX_MCP_TOOLS = ["mcp__litex__" + t for t in [
+    "litex_check", "litex_ident", "litex_connect", "litex_list_registers", "litex_list_memory_regions",
+    "litex_list_constants", "litex_read_register", "litex_read_registers", "litex_read_memory",
+    "litex_register_sequence", "litex_write_register", "litex_write_memory", "litex_console_read",
+    "litex_console_command", "litex_scope_list", "litex_scope_capture", "litex_sim_start",
+    "litex_server_start", "litex_build_start", "litex_build_report", "litex_list_jobs",
+    "litex_job_status", "litex_job_wait", "litex_job_stop", "litex_list_boards", "litex_board_info",
+    "litex_list_cpus", "litex_list_cores"]]
 
 RULES = ("Constraints for this session: work only inside the current directory and its "
     "subdirectories; only use the TCP ports, serial ports and boards given in the task; do not stop "
     "processes you did not start, except the bench described in the task if you need to restart it. "
     "When done, stop the simulations and servers you started.")
 
-def agent_command(prompt, condition, mcp, model=None):
+def agent_command(prompt, condition, mcp, model=None, operator_model="claude-haiku-5-5"):
     """Claude Code headless command line of a run in condition (tools restricted per condition)."""
     cmd = ["claude", "-p", prompt, "--strict-mcp-config", "--mcp-config", mcp,
         "--append-system-prompt", RULES, "--output-format", "stream-json", "--verbose"]
@@ -100,15 +146,29 @@ def agent_command(prompt, condition, mcp, model=None):
         "shell"   : ["Bash"] + FILE_TOOLS_ALLOWED,
         "mcp"     : ["Bash"] + FILE_TOOLS_ALLOWED + ["mcp__litex"],
         "mcponly" : FILE_TOOLS_ALLOWED + ["mcp__litex"],
+        "delegate": FILE_TOOLS_ALLOWED + ["Agent", "Task", "mcp__litex"],
     }[condition]
     cmd += ["--allowedTools"] + allowed
-    if condition == "mcponly":
+    if condition in ["mcponly", "delegate"]:
         cmd += ["--disallowedTools", "Bash"]
+    if condition == "delegate":
+        cmd += ["--agents", json.dumps({OPERATOR: {
+            "description" : OPERATOR_DESCRIPTION,
+            "prompt"      : OPERATOR_PROMPT,
+            "tools"       : LITEX_MCP_TOOLS,
+            "model"       : operator_model,
+        }})]
+        cmd += ["--settings", json.dumps({"hooks": {"PreToolUse": [{"matcher": "mcp__litex__.*",
+            "hooks": [{"type": "command", "command": operator_hook()}]}]}})]
+        i = cmd.index("--append-system-prompt") + 1
+        cmd[i] += (f" The running SoC is only reachable through the {OPERATOR} agent: delegate the "
+            "bench work to it with precise requests.")
     if model:
         cmd += ["--model", model]
     return cmd
 
-def agent_run(task, condition, outdir, index, model=None, timeout=3600, bench=False):
+def agent_run(task, condition, outdir, index, model=None, timeout=3600, bench=False,
+    operator_model="claude-haiku-5-5"):
     """One headless Claude Code run of task in a fresh workspace: transcript (stream-json) in
     <outdir>/<task>-<condition>-<index>.jsonl, check result in .check.json, wall time in .json.
 
@@ -118,7 +178,7 @@ def agent_run(task, condition, outdir, index, model=None, timeout=3600, bench=Fa
     name    = f"{task}-{condition}-{index}"
     workdir = os.path.join(outdir, "work", name)
     prompt  = setup_task(task, workdir)
-    if condition in ["mcp", "mcponly"]:
+    if condition in ["mcp", "mcponly", "delegate"]:
         mcp = os.path.join(outdir, "work", f"{name}.mcp.json")
         with open(mcp, "w") as f:
             json.dump(mcp_config(task, workdir), f)
@@ -131,8 +191,8 @@ def agent_run(task, condition, outdir, index, model=None, timeout=3600, bench=Fa
     start = time.time()
     with open(os.path.join(outdir, f"{name}.jsonl"), "w") as f:
         try:
-            subprocess.run(agent_command(prompt, condition, mcp, model), cwd=workdir, stdout=f,
-                stderr=subprocess.STDOUT, timeout=timeout)
+            subprocess.run(agent_command(prompt, condition, mcp, model, operator_model), cwd=workdir,
+                stdout=f, stderr=subprocess.STDOUT, timeout=timeout, env=_agent_env())
             timed_out = False
         except subprocess.TimeoutExpired:
             timed_out = True
@@ -148,6 +208,7 @@ def agent_run(task, condition, outdir, index, model=None, timeout=3600, bench=Fa
         json.dump(result, f, indent=2)
     with open(os.path.join(outdir, f"{name}.json"), "w") as f:
         json.dump({"task": task, "condition": condition, "index": index, "model": model,
+            "operator_model": operator_model if condition == "delegate" else None,
             "bench": bench, "wall_s": wall, "timed_out": timed_out}, f, indent=2)
     return result["passed"], wall
 
@@ -156,9 +217,11 @@ def agent_run(task, condition, outdir, index, model=None, timeout=3600, bench=Fa
 FILE_TOOLS = {"Read", "Write", "Edit", "MultiEdit", "Glob", "Grep", "NotebookEdit"}
 
 def parse_transcript(filename):
-    """Tool calls (MCP/shell/files/other), tokens and cost of a stream-json transcript."""
-    stats = {"mcp": 0, "shell": 0, "files": 0, "other": 0, "cost_usd": None,
-        "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0}
+    """Tool calls (MCP/shell/files/other, and for the delegate condition the delegations and the
+    operator's calls), turns, tokens and cost (total and per model) of a stream-json transcript."""
+    stats = {"mcp": 0, "shell": 0, "files": 0, "other": 0, "delegations": 0, "operator_calls": 0,
+        "turns": 0, "cost_usd": None, "cost_by_model": {}, "input_tokens": 0, "output_tokens": 0,
+        "cache_read_tokens": 0, "cache_write_tokens": 0}
     with open(filename, encoding="utf-8", errors="replace") as f:
         for line in f:
             try:
@@ -170,7 +233,11 @@ def parse_transcript(filename):
                     if block.get("type") != "tool_use":
                         continue
                     name = block.get("name", "")
-                    if name.startswith("mcp__litex__"):
+                    if event.get("parent_tool_use_id"):
+                        stats["operator_calls"] += 1
+                    if name in ["Agent", "Task"]:
+                        stats["delegations"] += 1
+                    elif name.startswith("mcp__litex__"):
                         stats["mcp"] += 1
                     elif name == "Bash":
                         stats["shell"] += 1
@@ -179,19 +246,24 @@ def parse_transcript(filename):
                     else:
                         stats["other"] += 1
             elif event.get("type") == "result":
+                # A session can emit several result events (background tasks): costs are cumulative,
+                # turns and usage are per segment.
                 usage = event.get("usage", {})
-                stats["cost_usd"]           = event.get("total_cost_usd")
-                stats["input_tokens"]       = usage.get("input_tokens", 0)
-                stats["output_tokens"]      = usage.get("output_tokens", 0)
-                stats["cache_read_tokens"]  = usage.get("cache_read_input_tokens", 0)
-                stats["cache_write_tokens"] = usage.get("cache_creation_input_tokens", 0)
+                stats["turns"]              += event.get("num_turns") or 0
+                stats["cost_usd"]            = event.get("total_cost_usd")
+                stats["input_tokens"]       += usage.get("input_tokens", 0)
+                stats["output_tokens"]      += usage.get("output_tokens", 0)
+                stats["cache_read_tokens"]  += usage.get("cache_read_input_tokens", 0)
+                stats["cache_write_tokens"] += usage.get("cache_creation_input_tokens", 0)
+                stats["cost_by_model"] = {m: round(u.get("costUSD", 0), 4)
+                    for m, u in event.get("modelUsage", {}).items()}
     return stats
 
 def score(outdir):
     """Per (task, condition): runs, pass rate, and medians on the passing runs."""
     runs = {}
     for filename in sorted(os.listdir(outdir)):
-        m = re.fullmatch(r"(.+)-(shell|mcp|mcponly)-(\d+)\.check\.json", filename)
+        m = re.fullmatch(r"(.+)-(shell|mcp|mcponly|delegate)-(\d+)\.check\.json", filename)
         if m is None:
             continue
         task, condition, index = m.group(1), m.group(2), m.group(3)
@@ -222,6 +294,8 @@ def score(outdir):
             "mcp"       : median([r.get("mcp")   for r in ok]),
             "shell"     : median([r.get("shell") for r in ok]),
             "files"     : median([r.get("files") for r in ok]),
+            "delegations": median([r.get("delegations") for r in ok]),
+            "turns"     : median([r.get("turns") for r in ok]),
             "cost_usd"  : median([r.get("cost_usd") for r in ok]),
             "out_tokens": median([r.get("output_tokens") for r in ok]),
         })
@@ -242,8 +316,8 @@ def mcp_config(task, workdir):
             f"--csr-csv={os.path.join(workdir, csr)}",
             f"--jobs-dir={os.path.join(workdir, '.litex_mcp')}"],
     }
-    if os.environ.get("PYTHONPATH"):
-        server["env"] = {"PYTHONPATH": os.environ["PYTHONPATH"]}
+    if _agent_pythonpath():
+        server["env"] = {"PYTHONPATH": _agent_pythonpath()}
     return {"mcpServers": {"litex": server}}
 
 # Main ---------------------------------------------------------------------------------------------
@@ -273,6 +347,7 @@ def main():
     p.add_argument("outdir")
     p.add_argument("--runs",    default=3, type=int, help="Number of sequential runs per condition.")
     p.add_argument("--bench",   action="store_true", help="Start the delivered SoC before each run.")
+    p.add_argument("--operator-model", default="claude-haiku-5-5", help="Bench operator model (delegate).")
     p.add_argument("--model",   default=None,        help="Model (claude --model).")
     p.add_argument("--timeout", default=3600, type=int, help="Timeout of a run (s).")
     p = sub.add_parser("score", help="Score the agent runs of a directory.")
@@ -332,7 +407,7 @@ def main():
             order = conditions if index % 2 == 0 else conditions[::-1]
             for condition in order:
                 passed, wall = agent_run(args.task, condition, outdir, index, model=args.model,
-                    timeout=args.timeout, bench=args.bench)
+                    timeout=args.timeout, bench=args.bench, operator_model=args.operator_model)
                 print(f"{args.task}-{condition}-{index}: {'PASS' if passed else 'FAIL'} ({wall}s)", flush=True)
 
     # Score.
@@ -341,7 +416,7 @@ def main():
         if args.json:
             print(json.dumps(rows, indent=2))
         else:
-            keys = ["task", "tier", "condition", "runs", "pass_rate", "wall_s", "mcp", "shell", "files", "cost_usd", "out_tokens"]
+            keys = ["task", "tier", "condition", "runs", "pass_rate", "wall_s", "turns", "mcp", "shell", "files", "delegations", "cost_usd", "out_tokens"]
             print(" | ".join(keys))
             for r in rows:
                 print(" | ".join(str(r[k]) for k in keys))

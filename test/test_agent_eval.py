@@ -75,3 +75,24 @@ def test_agent_command():
     assert "Bash" not in only[i:only.index("--disallowedTools")]
     assert only[only.index("--disallowedTools") + 1] == "Bash"
     assert only[-2:] == ["--model", "m"]
+
+def test_delegate_command():
+    import json
+    from litex_agent_eval.run import agent_command, OPERATOR
+    cmd = agent_command("p", "delegate", "cfg.json", model="claude-opus-5-5", operator_model="claude-haiku-5-5")
+    assert cmd[cmd.index("--disallowedTools") + 1] == "Bash"
+    agents = json.loads(cmd[cmd.index("--agents") + 1])
+    assert agents[OPERATOR]["model"] == "claude-haiku-5-5"
+    assert all(t.startswith("mcp__litex__") for t in agents[OPERATOR]["tools"])
+    hooks = json.loads(cmd[cmd.index("--settings") + 1])["hooks"]["PreToolUse"]
+    assert hooks[0]["matcher"] == "mcp__litex__.*"
+
+def test_operator_hook():
+    import json, subprocess
+    from litex_agent_eval.run import operator_hook, OPERATOR
+    def run(payload):
+        return subprocess.run(operator_hook(), shell=True, input=json.dumps(payload), capture_output=True, text=True)
+    r = run({"tool_name": "mcp__litex__litex_check"})
+    assert json.loads(r.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
+    r = run({"tool_name": "mcp__litex__litex_check", "agent_type": OPERATOR})
+    assert r.returncode == 0 and r.stdout == ""

@@ -124,6 +124,7 @@ condition:
 | `shell`   | Bash and file tools, no MCP server. |
 | `mcp`     | Bash, file tools and `litex_mcp` (the agent chooses). |
 | `mcponly` | `litex_mcp` and file tools, no shell. |
+| `delegate` | A planner (`--model`) with file tools and a `bench-operator` subagent (`--operator-model`, default Haiku) that only has `litex_mcp`. No shell; a PreToolUse hook denies MCP calls that do not come from the operator, so the planner reaches the bench only by delegating. |
 
 Several conditions (`shell,mcponly`) run in alternating order between runs. `--bench` starts the
 delivered SoC before each run (simulated, or built once and loaded to the board's SRAM), with a
@@ -134,10 +135,13 @@ anything the agent left running in its workspace are stopped before the check.
 ```sh
 export PYTHONPATH=<litex_agent_eval>      # with LiteX installed
 python3 -m litex_agent_eval.run agent opaque_gain shell,mcponly runs/opus --runs 3 --bench --model claude-opus-5-5
+python3 -m litex_agent_eval.run agent opaque_gain delegate runs/opus --runs 3 --bench --model claude-opus-5-5 --operator-model claude-haiku-5-5
 python3 -m litex_agent_eval.run score runs/opus
 ```
 
-Use one output directory per model. Runs of different tasks can share the machine (each task has
+Use one output directory per model. The agent's `PYTHONPATH` is the caller's without this
+repository (LiteX and its cores must be on it, the checkers must not); run the runner with a Python
+that has the MCP SDK, since `litex_mcp` is started with the runner's interpreter. Runs of different tasks can share the machine (each task has
 its own ports) but contend for CPU, which distorts wall times.
 
 ### By hand
