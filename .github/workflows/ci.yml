@@ -1,0 +1,19 @@
+name: ci
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install LiteX
+        run: |
+          pip install pytest
+          pip install git+https://github.com/m-labs/migen
+          pip install git+https://github.com/enjoy-digital/litex
+      - name: Tests (layout, offline task, runner)
+        run: PYTHONPATH=. python3 -m pytest -v test
